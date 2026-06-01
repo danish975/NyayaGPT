@@ -1,0 +1,275 @@
+"use client";
+
+import { useState, useMemo } from "react";
+import Link from "next/link";
+import { Scale, ArrowLeft, GitCompare, Download } from "lucide-react";
+import { DarkModeToggle } from "@/components/ui/DarkModeToggle";
+
+type PolicyData = {
+  id: string;
+  name: string;
+  objective: string;
+  benefits: string;
+  eligibility: string;
+  duration: string;
+  ministry: string;
+  year: number;
+};
+
+const POLICIES: PolicyData[] = [
+  {
+    id: "pmay",
+    name: "PMAY-U",
+    objective:
+      "Housing for all urban poor through subsidized loans and direct construction support.",
+    benefits:
+      "Interest subsidy 3-6.5% on home loans; central assistance ₹1-2.5 lakh per house.",
+    eligibility:
+      "EWS (≤₹3L), LIG (₹3-6L), MIG-I (₹6-12L), MIG-II (₹12-18L annual income).",
+    duration: "2015–2022 (extended)",
+    ministry: "Ministry of Housing & Urban Affairs",
+    year: 2015,
+  },
+  {
+    id: "mgnrega",
+    name: "MGNREGA",
+    objective:
+      "100 days of guaranteed wage employment per year to rural households.",
+    benefits:
+      "Minimum 100 days unskilled work; unemployment allowance if not provided within 15 days.",
+    eligibility:
+      "Any adult member of a rural household willing to do unskilled manual work.",
+    duration: "2005–ongoing",
+    ministry: "Ministry of Rural Development",
+    year: 2005,
+  },
+  {
+    id: "ayushman",
+    name: "Ayushman Bharat PM-JAY",
+    objective:
+      "₹5 lakh per family per year health cover for secondary/tertiary care hospitalization.",
+    benefits:
+      "Cashless treatment at empanelled hospitals; covers 1,929+ medical packages.",
+    eligibility:
+      "Based on SECC-2011 deprivation criteria; no cap on family size or age.",
+    duration: "2018–ongoing",
+    ministry: "National Health Authority",
+    year: 2018,
+  },
+  {
+    id: "pm-kisan",
+    name: "PM-KISAN",
+    objective:
+      "₹6,000 per year income support to landholding farmer families.",
+    benefits:
+      "₹2,000 every 4 months directly to bank account via DBT.",
+    eligibility: "All landholding farmer families (with some exclusions).",
+    duration: "2019–ongoing",
+    ministry: "Ministry of Agriculture",
+    year: 2019,
+  },
+  {
+    id: "nep",
+    name: "NEP 2020",
+    objective:
+      "Overhaul India's education system with new 5+3+3+4 structure and multidisciplinary approach.",
+    benefits:
+      "Multiple exit points, Academic Bank of Credits, mother tongue instruction, NETF.",
+    eligibility: "All students and educational institutions in India.",
+    duration: "2020–ongoing (target: 2040 for full implementation)",
+    ministry: "Ministry of Education",
+    year: 2020,
+  },
+  {
+    id: "dpdp",
+    name: "DPDP Act 2023",
+    objective:
+      "Protect digital personal data of individuals while enabling lawful processing.",
+    benefits:
+      "Right to access, correct, erase personal data; consent-based processing.",
+    eligibility: "All data principals (individuals) in India.",
+    duration: "2023–ongoing",
+    ministry: "Ministry of Electronics & IT",
+    year: 2023,
+  },
+  {
+    id: "ujjwala",
+    name: "PM Ujjwala Yojana",
+    objective: "Free LPG connections to BPL households to reduce indoor pollution.",
+    benefits: "Free LPG connection; first refill and stove free; deposit-free.",
+    eligibility: "Adult woman from BPL household (SECC-2011 list).",
+    duration: "2016–ongoing",
+    ministry: "Ministry of Petroleum & Natural Gas",
+    year: 2016,
+  },
+  {
+    id: "rti",
+    name: "RTI Act 2005",
+    objective: "Enable citizens to access information from public authorities.",
+    benefits: "Any citizen can request information; response within 30 days; life/liberty within 48 hours.",
+    eligibility: "Any Indian citizen.",
+    duration: "2005–ongoing",
+    ministry: "Department of Personnel & Training",
+    year: 2005,
+  },
+];
+
+const COMPARE_FIELDS: { key: keyof PolicyData; label: string }[] = [
+  { key: "objective", label: "Objective" },
+  { key: "benefits", label: "Benefits" },
+  { key: "eligibility", label: "Eligibility" },
+  { key: "duration", label: "Duration" },
+  { key: "ministry", label: "Ministry" },
+  { key: "year", label: "Year" },
+];
+
+export default function ComparePage() {
+  const [leftId, setLeftId] = useState("pmay");
+  const [rightId, setRightId] = useState("mgnrega");
+
+  const leftPolicy = useMemo(
+    () => POLICIES.find((p) => p.id === leftId)!,
+    [leftId]
+  );
+  const rightPolicy = useMemo(
+    () => POLICIES.find((p) => p.id === rightId)!,
+    [rightId]
+  );
+
+  function exportMarkdown() {
+    let md = `# Policy Comparison: ${leftPolicy.name} vs ${rightPolicy.name}\n\n`;
+    md += `| Feature | ${leftPolicy.name} | ${rightPolicy.name} |\n`;
+    md += `|---------|${"-".repeat(leftPolicy.name.length + 2)}|${"-".repeat(rightPolicy.name.length + 2)}|\n`;
+    for (const field of COMPARE_FIELDS) {
+      md += `| ${field.label} | ${leftPolicy[field.key]} | ${rightPolicy[field.key]} |\n`;
+    }
+    md += `\n_Generated by NyayaGPT · ${new Date().toLocaleDateString()}_\n`;
+
+    const blob = new Blob([md], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `compare-${leftPolicy.id}-vs-${rightPolicy.id}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="min-h-screen bg-background">
+      <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur">
+        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4">
+          <Link href="/" className="flex items-center gap-2">
+            <ArrowLeft className="h-4 w-4 text-muted-foreground" />
+            <span className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-emblem text-accent">
+              <Scale className="h-5 w-5" />
+            </span>
+            <span className="font-display text-xl font-semibold text-foreground">
+              Nyaya<span className="text-gradient-gold">GPT</span>
+            </span>
+          </Link>
+          <DarkModeToggle />
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl px-4 py-10">
+        <div className="mb-8">
+          <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-gold/40 bg-gold-soft/40 px-3 py-1 text-xs font-medium">
+            <GitCompare className="h-3.5 w-3.5 text-accent" />
+            Side-by-side analysis
+          </div>
+          <h1 className="font-display text-4xl text-foreground sm:text-5xl">
+            Compare <span className="text-gradient-gold">Policies</span>
+          </h1>
+          <p className="mt-3 max-w-2xl text-muted-foreground">
+            Select two schemes, acts, or policies to compare them across
+            objective, benefits, eligibility, and more.
+          </p>
+        </div>
+
+        {/* Selectors */}
+        <div className="mb-8 grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Policy A
+            </label>
+            <select
+              value={leftId}
+              onChange={(e) => setLeftId(e.target.value)}
+              className="w-full rounded-lg border bg-card px-3 py-2.5 text-sm text-foreground"
+            >
+              {POLICIES.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Policy B
+            </label>
+            <select
+              value={rightId}
+              onChange={(e) => setRightId(e.target.value)}
+              className="w-full rounded-lg border bg-card px-3 py-2.5 text-sm text-foreground"
+            >
+              {POLICIES.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Comparison Table */}
+        <div className="overflow-x-auto rounded-xl border bg-card shadow-sm">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b bg-muted/30">
+                <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Feature
+                </th>
+                <th className="px-4 py-3 text-left font-display text-base text-foreground">
+                  {leftPolicy.name}
+                </th>
+                <th className="px-4 py-3 text-left font-display text-base text-foreground">
+                  {rightPolicy.name}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {COMPARE_FIELDS.map((field, i) => (
+                <tr
+                  key={field.key}
+                  className={i % 2 === 0 ? "" : "bg-muted/10"}
+                >
+                  <td className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    {field.label}
+                  </td>
+                  <td className="px-4 py-3 text-foreground">
+                    {String(leftPolicy[field.key])}
+                  </td>
+                  <td className="px-4 py-3 text-foreground">
+                    {String(rightPolicy[field.key])}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Export */}
+        <div className="mt-6 flex gap-3">
+          <button
+            onClick={exportMarkdown}
+            className="inline-flex items-center gap-2 rounded-lg border bg-card px-4 py-2 text-sm font-medium text-foreground transition hover:border-gold"
+          >
+            <Download className="h-4 w-4" />
+            Export Markdown
+          </button>
+        </div>
+      </main>
+    </div>
+  );
+}
