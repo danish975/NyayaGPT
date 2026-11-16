@@ -8,7 +8,12 @@ export type Citation = {
   year?: number;
   excerpt: string;
   url?: string;
+  /** Fused hybrid score (Reciprocal Rank Fusion), or the BM25 score in BM25-only mode. */
   score: number;
+  /** BM25 keyword score, if the section matched any query terms. */
+  bm25?: number;
+  /** Cosine similarity from vector search, if it passed the similarity threshold. */
+  vector?: number;
 };
 
 export type RetrievalStep = {
@@ -19,8 +24,15 @@ export type RetrievalStep = {
 
 export type RetrievalTrace = {
   query: string;
+  /** "hybrid" when vector search ran; "bm25" when it was unavailable. */
+  mode: "hybrid" | "bm25";
+  /** BM25 keyword matches, best first. */
+  bm25: RetrievalStep[];
+  /** Vector (semantic) matches above the threshold, best first. */
+  vector: RetrievalStep[];
+  /** Fused ranking of both lists. */
   retrieved: RetrievalStep[];
-  reranked: RetrievalStep[];
+  topRanked: RetrievalStep[];
   contextUsed: string[];
 };
 

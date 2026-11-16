@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Link from "next/link";
 import {
-  Send,
+  ArrowUp,
   Scale,
   Sparkles,
   Loader2,
@@ -14,15 +14,36 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
-  ArrowLeft,
+  Copy,
+  Bookmark,
+  BookmarkCheck,
+  ExternalLink,
+  PanelLeft,
+  X,
+  Save,
+  SquarePen,
+  RotateCcw,
+  FileText,
+  Landmark,
+  GraduationCap,
+  HeartPulse,
+  Home,
+  ShieldCheck,
 } from "lucide-react";
-import { DarkModeToggle } from "@/components/ui/DarkModeToggle";
-import { retrieve } from "@/lib/retrieval";
+import { Header } from "@/components/layout/Header";
+import { AnswerMarkdown } from "@/components/chat/AnswerMarkdown";
+import { Skeleton, Tooltip } from "@/components/ui/primitives";
+import { toast } from "@/components/ui/Toaster";
+import { useWorkspaceStore } from "@/store/workspace-store";
+import { useHydrated, usePrefersReducedMotion } from "@/lib/use-hydrated";
+import { cn } from "@/lib/utils";
 import type { Citation, RetrievalTrace, RetrievalStep } from "@/store/chat-store";
 
 type Turn = {
   role: "user" | "assistant";
   content: string;
+  /** Server signature proving this answer came from /api/chat; required by /api/simplify. */
+  answerToken?: string;
   simplified?: string;
   showSimplified?: boolean;
   citations?: Citation[];
@@ -31,310 +52,351 @@ type Turn = {
   feedback?: "up" | "down" | "halluc";
   error?: string;
   simplifying?: boolean;
+  /** True while the answer is being progressively revealed. */
+  revealing?: boolean;
 };
 
-const SUGGESTIONS = [
-  "What is the RTI filing process under Section 6?",
-  "Explain Article 21 in simple language.",
-  "Am I eligible for PMAY if my income is ₹5 lakh?",
-  "How many days of work does MGNREGA guarantee?",
-  "What does the DPDP Act say about consent?",
-  "मुझे NEP 2020 के बारे में बताइए।",
+const SUGGESTIONS: { q: string; icon: React.ReactNode; tag: string }[] = [
+  { q: "What is the RTI filing process under Section 6?", icon: <FileText className="h-4 w-4" />, tag: "RTI Act" },
+  { q: "Explain Article 21 in simple language.", icon: <Landmark className="h-4 w-4" />, tag: "Constitution" },
+  { q: "Am I eligible for PMAY if my income is ₹5 lakh?", icon: <Home className="h-4 w-4" />, tag: "Housing" },
+  { q: "How many days of work does MGNREGA guarantee?", icon: <HeartPulse className="h-4 w-4" />, tag: "Employment" },
+  { q: "What does the DPDP Act say about consent?", icon: <ShieldCheck className="h-4 w-4" />, tag: "Data privacy" },
+  { q: "मुझे NEP 2020 के बारे में बताइए।", icon: <GraduationCap className="h-4 w-4" />, tag: "हिन्दी" },
 ];
 
-function computeConfidence(chunks: { score: number }[]): number {
-  if (chunks.length === 0) return 0;
-  const top = chunks[0].score;
-  const base = Math.min(1, top / 6);
-  const breadth = Math.min(1, chunks.length / 3) * 0.2;
-  return Math.round(Math.min(0.99, 0.55 + base * 0.4 + breadth) * 100) / 100;
-}
+const MAX_QUESTION_CHARS = 1000;
 
 export default function ChatPage() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [activeTurn, setActiveTurn] = useState<number | null>(null);
+  const [focusedCite, setFocusedCite] = useState<{ turn: number; n: number } | null>(null);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const chatId = useRef<string | null>(null);
+  const autoAsked = useRef(false);
 
-  const latestAssistant = [...turns].reverse().find((t) => t.role === "assistant");
+  const addHistory = useWorkspaceStore((s) => s.addHistory);
+  const addChat = useWorkspaceStore((s) => s.addChat);
 
+  const lastAssistantIdx = (() => {
+    for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "assistant") return i;
+    return null;
+  })();
+  const sourcesTurnIdx = activeTurn ?? lastAssistantIdx;
+  const sourcesTurn = sourcesTurnIdx !== null ? turns[sourcesTurnIdx] : undefined;
+
+  // Keep the newest content in view.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [turns, loading]);
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [turns.length, loading]);
 
-  async function submit(q: string) {
-    const question = q.trim();
-    if (!question || loading) return;
-    setInput("");
-    setTurns((t) => [...t, { role: "user", content: question }]);
-    setLoading(true);
+  // Auto-grow the composer.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 180)}px`;
+  }, [input]);
 
-    try {
-      // BM25 retrieval
-      const wide = retrieve(question, 12);
-      const reranked = wide.slice(0, 5);
-      const chunks = reranked.slice(0, 3);
+  // Close the mobile sources drawer with Escape.
+  useEffect(() => {
+    if (!sourcesOpen) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setSourcesOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sourcesOpen]);
 
-      const trace: RetrievalTrace = {
-        query: question,
-        retrieved: wide.map((c) => ({
-          id: c.id,
-          label: `${c.doc} · ${c.section}`,
-          score: +c.score.toFixed(3),
-        })),
-        reranked: reranked.map((c) => ({
-          id: c.id,
-          label: `${c.doc} · ${c.section}`,
-          score: +c.score.toFixed(3),
-        })),
-        contextUsed: chunks.map((c) => c.id),
-      };
+  const ask = useCallback(
+    async (question: string) => {
+      setLoading(true);
+      addHistory(question);
+      try {
+        // The server retrieves the sources, calls the LLM, and returns citations + trace.
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
 
-      if (chunks.length === 0) {
+        const data: {
+          answer?: string;
+          answerToken?: string;
+          citations?: Citation[];
+          confidence?: number;
+          trace?: RetrievalTrace;
+          error?: string;
+        } = await res.json();
+
         setTurns((t) => [
           ...t,
           {
             role: "assistant",
-            content:
-              "I couldn't find anything in the indexed corpus that matches your question. Try rephrasing, or ask about RTI, the Constitution (Articles 14/19/21), PMAY, NEP 2020, MGNREGA, or the DPDP Act.",
-            citations: [],
-            confidence: 0,
-            trace,
+            content: data.answer || data.error || "No answer.",
+            answerToken: data.answerToken,
+            citations: data.citations ?? [],
+            confidence: data.confidence,
+            trace: data.trace,
+            error: data.error,
+            revealing: !data.error,
           },
         ]);
+      } catch (err) {
+        setTurns((t) => [
+          ...t,
+          {
+            role: "assistant",
+            content: "Something went wrong. Please check your connection and try again.",
+            error: String(err),
+          },
+        ]);
+      } finally {
+        setActiveTurn(null);
         setLoading(false);
-        return;
       }
+    },
+    [addHistory]
+  );
 
-      // Call our API route (which calls Groq)
-      const sourcesBlock = chunks
-        .map(
-          (c, i) =>
-            `[${i + 1}] ${c.doc} — ${c.section}${c.year ? ` (${c.year})` : ""}\n"""${c.text}"""`
-        )
-        .join("\n\n");
+  const submit = useCallback(
+    (q: string) => {
+      const question = q.trim();
+      if (!question || loading || question.length > MAX_QUESTION_CHARS) return;
+      setInput("");
+      setTurns((t) => [...t, { role: "user", content: question }]);
+      void ask(question);
+    },
+    [ask, loading]
+  );
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, sources: sourcesBlock }),
-      });
-
-      const data = await res.json();
-
-      const citations: Citation[] = chunks.map((c) => ({
-        id: c.id,
-        doc: c.doc,
-        act: c.act,
-        section: c.section,
-        year: c.year,
-        excerpt: c.text,
-        url: c.url,
-        score: +c.score.toFixed(3),
-      }));
-
-      setTurns((t) => [
-        ...t,
-        {
-          role: "assistant",
-          content: data.answer || data.error || "No answer.",
-          citations,
-          confidence: computeConfidence(chunks),
-          trace,
-          error: data.error,
-        },
-      ]);
-    } catch (err) {
-      setTurns((t) => [
-        ...t,
-        {
-          role: "assistant",
-          content: "Something went wrong. Please try again.",
-          error: String(err),
-        },
-      ]);
-    } finally {
-      setLoading(false);
+  // Support /chat?q=... (used by "Ask about this" links in the Library).
+  useEffect(() => {
+    if (autoAsked.current) return;
+    autoAsked.current = true;
+    const q = new URLSearchParams(window.location.search).get("q");
+    if (q) {
+      window.history.replaceState(null, "", "/chat");
+      submit(q);
     }
+  }, [submit]);
+
+  function retry(idx: number) {
+    const question = turns[idx - 1]?.content;
+    if (!question || loading) return;
+    setTurns((t) => t.slice(0, idx));
+    void ask(question);
   }
 
   async function runSimplify(idx: number) {
-    setTurns((t) =>
-      t.map((x, i) => (i === idx ? { ...x, simplifying: true } : x))
-    );
+    setTurns((t) => t.map((x, i) => (i === idx ? { ...x, simplifying: true } : x)));
     try {
       const turn = turns[idx];
       const res = await fetch("/api/simplify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answer: turn.content }),
+        body: JSON.stringify({ answer: turn.content, answerToken: turn.answerToken }),
       });
       const data = await res.json();
+      const simplified: string | undefined = data.simplified || turn.simplified;
+      if (!simplified) toast(data.error || "Could not simplify this answer.", "error");
       setTurns((t) =>
         t.map((x, i) =>
           i === idx
-            ? {
-                ...x,
-                simplified: data.simplified || x.simplified,
-                showSimplified: true,
-                simplifying: false,
-              }
+            ? { ...x, simplified, showSimplified: Boolean(simplified), simplifying: false }
             : x
         )
       );
     } catch {
-      setTurns((t) =>
-        t.map((x, i) => (i === idx ? { ...x, simplifying: false } : x))
-      );
+      toast("Could not simplify this answer.", "error");
+      setTurns((t) => t.map((x, i) => (i === idx ? { ...x, simplifying: false } : x)));
     }
   }
 
   function setFeedback(idx: number, fb: Turn["feedback"]) {
-    setTurns((t) =>
-      t.map((x, i) => (i === idx ? { ...x, feedback: fb } : x))
-    );
+    setTurns((t) => t.map((x, i) => (i === idx ? { ...x, feedback: fb } : x)));
+    if (fb) toast("Thanks — your feedback was recorded.", "info");
   }
 
   function toggleVariant(idx: number) {
     setTurns((t) =>
-      t.map((x, i) =>
-        i === idx ? { ...x, showSimplified: !x.showSimplified } : x
-      )
+      t.map((x, i) => (i === idx ? { ...x, showSimplified: !x.showSimplified } : x))
     );
   }
 
-  return (
-    <div className="flex min-h-screen flex-col bg-background">
-      {/* Header */}
-      <header className="border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4">
-          <Link href="/" className="flex items-center gap-2">
-            <ArrowLeft className="h-4 w-4 text-muted-foreground" />
-            <span className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-emblem text-accent">
-              <Scale className="h-5 w-5" />
-            </span>
-            <span className="font-display text-xl font-semibold text-foreground">
-              Nyaya<span className="text-gradient-gold">GPT</span>
-            </span>
-          </Link>
-          <div className="flex items-center gap-2">
-            <Link
-              href="/library"
-              className="hidden rounded-md px-3 py-2 text-sm text-muted-foreground transition hover:text-foreground sm:inline"
-            >
-              Library
-            </Link>
-            <Link
-              href="/eligibility"
-              className="hidden rounded-md px-3 py-2 text-sm text-muted-foreground transition hover:text-foreground sm:inline"
-            >
-              Eligibility
-            </Link>
-            <DarkModeToggle />
-          </div>
-        </div>
-      </header>
+  function finishReveal(idx: number) {
+    setTurns((t) => t.map((x, i) => (i === idx ? { ...x, revealing: false } : x)));
+  }
 
-      <div className="mx-auto flex flex-1 max-w-7xl gap-4 px-4">
-        {/* Sources Panel (left) */}
-        <aside className="hidden w-80 shrink-0 flex-col border-r pr-4 lg:flex">
-          <div className="flex items-center gap-2 py-4">
-            <BookOpen className="h-4 w-4 text-accent" />
-            <h2 className="font-display text-sm font-semibold uppercase tracking-wider text-foreground">
-              Sources
-            </h2>
-          </div>
-          <div className="flex-1 space-y-3 overflow-y-auto pb-6">
-            {!latestAssistant?.citations?.length ? (
-              <p className="text-xs text-muted-foreground">
-                Retrieved sections will appear here after you ask a question.
-              </p>
-            ) : (
-              latestAssistant.citations.map((c, i) => (
-                <a
-                  key={c.id}
-                  href={`#cite-${c.id}`}
-                  className="block scroll-mt-20 rounded-lg border bg-card p-3 text-xs transition hover:border-gold"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-accent-foreground">
-                      {i + 1}
-                    </span>
-                    <span className="font-semibold text-foreground">
-                      {c.act ?? c.doc}
-                    </span>
-                  </div>
-                  <div className="mt-1 text-muted-foreground">{c.section}</div>
-                  <div className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">
-                    score {c.score}
-                  </div>
-                </a>
-              ))
+  function openCitation(turnIdx: number, n: number) {
+    setActiveTurn(turnIdx);
+    setFocusedCite({ turn: turnIdx, n });
+    const el = document.getElementById(`cite-${turnIdx}-${n}`);
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function newChat() {
+    setTurns([]);
+    setActiveTurn(null);
+    setFocusedCite(null);
+    chatId.current = null;
+    textareaRef.current?.focus();
+  }
+
+  function saveChat() {
+    const firstQ = turns.find((t) => t.role === "user")?.content ?? "Conversation";
+    const lastA = [...turns].reverse().find((t) => t.role === "assistant" && !t.error);
+    chatId.current ??= `chat-${Date.now()}`;
+    addChat({
+      id: chatId.current,
+      title: firstQ.length > 80 ? `${firstQ.slice(0, 77)}…` : firstQ,
+      preview: (lastA?.content ?? "").replace(/[*#`]/g, "").slice(0, 180),
+      date: new Date().toLocaleString(),
+      messageCount: turns.length,
+    });
+    toast("Conversation saved to your Workspace.");
+  }
+
+  const sourcesPanel = (
+    <SourcesPanel
+      turn={sourcesTurn}
+      turnIdx={sourcesTurnIdx}
+      isLatest={sourcesTurnIdx === lastAssistantIdx}
+      focusedN={focusedCite && focusedCite.turn === sourcesTurnIdx ? focusedCite.n : null}
+      loading={loading}
+      onSelect={(n) => sourcesTurnIdx !== null && openCitation(sourcesTurnIdx, n)}
+      onShowLatest={() => setActiveTurn(null)}
+    />
+  );
+
+  const sourceCount = sourcesTurn?.citations?.length ?? 0;
+  const overLimit = input.length > MAX_QUESTION_CHARS;
+
+  return (
+    <div className="flex h-dvh flex-col bg-background">
+      <Header
+        wide
+        hideChatCta
+        actions={
+          <>
+            <button
+              onClick={() => setSourcesOpen(true)}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border bg-card px-3 text-sm text-foreground transition hover:border-gold lg:hidden"
+              aria-label="Show sources"
+            >
+              <PanelLeft className="h-4 w-4" />
+              <span className="hidden sm:inline">Sources</span>
+              {sourceCount > 0 && (
+                <span className="rounded-full bg-gold-soft px-1.5 text-[11px] font-semibold text-gold-ink">
+                  {sourceCount}
+                </span>
+              )}
+            </button>
+            {turns.length > 0 && (
+              <>
+                <Tooltip label="Save to Workspace" side="bottom">
+                  <button
+                    onClick={saveChat}
+                    aria-label="Save conversation to Workspace"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-lg border bg-card text-muted-foreground transition hover:border-gold hover:text-foreground"
+                  >
+                    <Save className="h-4 w-4" />
+                  </button>
+                </Tooltip>
+                <Tooltip label="New chat" side="bottom">
+                  <button
+                    onClick={newChat}
+                    aria-label="Start a new chat"
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-lg border bg-card text-muted-foreground transition hover:border-gold hover:text-foreground"
+                  >
+                    <SquarePen className="h-4 w-4" />
+                  </button>
+                </Tooltip>
+              </>
             )}
-          </div>
+          </>
+        }
+      />
+
+      <div className="mx-auto flex min-h-0 w-full max-w-[1440px] flex-1">
+        {/* Sources sidebar (desktop) */}
+        <aside
+          aria-label="Sources"
+          className="hidden w-[340px] shrink-0 flex-col border-r bg-card/40 lg:flex"
+        >
+          {sourcesPanel}
         </aside>
 
-        {/* Chat / AI Assistant (right) */}
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex-1 overflow-y-auto py-6">
-            {turns.length === 0 ? (
-              <div className="mx-auto max-w-2xl text-center">
-                <div className="mx-auto mb-6 inline-flex h-14 w-14 items-center justify-center rounded-full bg-emblem text-accent">
-                  <Scale className="h-7 w-7" />
-                </div>
-                <h2 className="font-display text-3xl text-foreground">
-                  Ask NyayaGPT
-                </h2>
-                <p className="mt-3 text-muted-foreground">
-                  Source-grounded answers on Indian laws, schemes, and the
-                  Constitution. Every answer cites the section it came from.
-                </p>
-                <div className="mt-8 grid gap-2 sm:grid-cols-2">
-                  {SUGGESTIONS.map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => submit(s)}
-                      className="rounded-lg border bg-card px-4 py-3 text-left text-sm text-foreground transition hover:border-gold hover:shadow-sm"
-                    >
-                      {s}
-                    </button>
+        {/* Sources drawer (mobile / tablet) */}
+        {sourcesOpen && (
+          <div className="fixed inset-0 z-[60] lg:hidden" role="dialog" aria-modal="true" aria-label="Sources">
+            <button
+              aria-label="Close sources"
+              onClick={() => setSourcesOpen(false)}
+              className="absolute inset-0 animate-fade-in bg-black/40 backdrop-blur-[2px]"
+            />
+            <div className="absolute inset-y-0 left-0 flex w-[88%] max-w-sm animate-fade-up flex-col border-r bg-background shadow-elegant">
+              <button
+                onClick={() => setSourcesOpen(false)}
+                aria-label="Close sources"
+                className="absolute right-3 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg border bg-card text-muted-foreground"
+              >
+                <X className="h-4 w-4" />
+              </button>
+              {sourcesPanel}
+            </div>
+          </div>
+        )}
+
+        {/* Conversation */}
+        <main id="main" className="flex min-w-0 flex-1 flex-col">
+          <div ref={scrollRef} className="scrollbar-thin flex-1 overflow-y-auto overflow-x-hidden">
+            <div className="mx-auto w-full max-w-3xl px-4 py-8 sm:px-6">
+              {turns.length === 0 ? (
+                <EmptyChat onPick={submit} />
+              ) : (
+                <div className="space-y-8">
+                  {turns.map((t, i) => (
+                    <TurnView
+                      key={i}
+                      turn={t}
+                      index={i}
+                      focusedN={focusedCite?.turn === i ? focusedCite.n : null}
+                      onCite={(n) => openCitation(i, n)}
+                      onSimplify={() => runSimplify(i)}
+                      onToggleVariant={() => toggleVariant(i)}
+                      onFeedback={(fb) => setFeedback(i, fb)}
+                      onRetry={() => retry(i)}
+                      onRevealDone={() => finishReveal(i)}
+                    />
                   ))}
+                  {loading && <ThinkingBubble />}
                 </div>
-              </div>
-            ) : (
-              <div className="space-y-8">
-                {turns.map((t, i) => (
-                  <TurnView
-                    key={i}
-                    turn={t}
-                    onSimplify={() => runSimplify(i)}
-                    onToggleVariant={() => toggleVariant(i)}
-                    onFeedback={(fb) => setFeedback(i, fb)}
-                  />
-                ))}
-                {loading && (
-                  <div className="flex items-center gap-2 text-muted-foreground">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    <span className="text-sm">
-                      Retrieving sources and drafting answer…
-                    </span>
-                  </div>
-                )}
-                <div ref={endRef} />
-              </div>
-            )}
+              )}
+            </div>
           </div>
 
-          {/* Composer */}
-          <div className="border-t bg-background/80 py-4 backdrop-blur">
+          {/* Composer (stays pinned to the bottom of the column) */}
+          <div className="border-t bg-background/85 px-4 pb-4 pt-3 backdrop-blur sm:px-6">
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 submit(input);
               }}
-              className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border bg-card p-2 shadow-sm focus-within:border-gold focus-within:shadow-md"
+              className={cn(
+                "mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border bg-card p-2 shadow-card transition focus-within:border-gold focus-within:shadow-lift",
+                overLimit && "border-destructive focus-within:border-destructive"
+              )}
             >
+              <label htmlFor="chat-input" className="sr-only">
+                Ask a legal question
+              </label>
               <textarea
+                id="chat-input"
+                ref={textareaRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -345,341 +407,652 @@ export default function ChatPage() {
                 }}
                 rows={1}
                 placeholder="Ask about RTI, PMAY, Article 21, DPDP, NEP 2020, MGNREGA…"
-                className="max-h-40 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
+                className="max-h-[180px] min-h-[44px] flex-1 resize-none bg-transparent px-3 py-2.5 text-[15px] text-foreground outline-none placeholder:text-muted-foreground"
               />
               <button
                 type="submit"
-                disabled={loading || !input.trim()}
-                className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+                disabled={loading || !input.trim() || overLimit}
+                aria-label="Send question"
+                className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-card transition hover:opacity-90 disabled:opacity-40"
               >
-                {loading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Send className="h-4 w-4" />
-                )}
-                Ask
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-5 w-5" />}
               </button>
             </form>
-            <p className="mx-auto mt-2 max-w-3xl text-center text-xs text-muted-foreground">
-              <Sparkles className="mr-1 inline h-3 w-3 text-accent" />
-              NyayaGPT cites every source. This is informational and not legal
-              advice.
-            </p>
+            <div className="mx-auto mt-2 flex max-w-3xl items-center justify-between gap-3 px-1 text-[11px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1">
+                <Sparkles className="h-3 w-3 text-gold-ink" />
+                Answers cite their sources. Informational only — not legal advice.
+              </span>
+              <span className={cn("hidden shrink-0 sm:inline", overLimit && "text-destructive")}>
+                {input.length > 800
+                  ? `${input.length}/${MAX_QUESTION_CHARS}`
+                  : "Enter to send · Shift+Enter for a new line"}
+              </span>
+            </div>
           </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+/* ─── Empty state ───────────────────────────────────────────────────── */
+
+function EmptyChat({ onPick }: { onPick: (q: string) => void }) {
+  return (
+    <div className="animate-fade-up pt-4 text-center sm:pt-10">
+      <div className="mx-auto mb-6 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-emblem text-accent shadow-gold">
+        <Scale className="h-7 w-7" />
+      </div>
+      <h1 className="font-display text-3xl text-foreground sm:text-4xl">Ask NyayaGPT</h1>
+      <p className="mx-auto mt-3 max-w-lg text-muted-foreground">
+        Source-grounded answers on Indian laws, schemes, and the Constitution. Every
+        answer cites the section it came from.
+      </p>
+      <div className="mt-10 grid gap-3 text-left sm:grid-cols-2">
+        {SUGGESTIONS.map((s, i) => (
+          <button
+            key={s.q}
+            onClick={() => onPick(s.q)}
+            style={{ animationDelay: `${80 + i * 50}ms` }}
+            className="group flex animate-fade-up items-start gap-3 rounded-xl border bg-card p-4 text-sm text-foreground shadow-card transition hover:-translate-y-0.5 hover:border-gold hover:shadow-lift"
+          >
+            <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gold-soft text-gold-ink transition group-hover:bg-accent group-hover:text-accent-foreground">
+              {s.icon}
+            </span>
+            <span>
+              <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                {s.tag}
+              </span>
+              <span className="mt-0.5 block leading-snug">{s.q}</span>
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Loading ───────────────────────────────────────────────────────── */
+
+function ThinkingBubble() {
+  const [phase, setPhase] = useState(0);
+  useEffect(() => {
+    const id = setTimeout(() => setPhase(1), 1200);
+    return () => clearTimeout(id);
+  }, []);
+  return (
+    <div className="flex animate-fade-in items-start gap-3" aria-live="polite">
+      <AssistantAvatar />
+      <div className="flex-1 space-y-3">
+        <div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin text-gold-ink" />
+          {phase === 0 ? "Searching the legal corpus…" : "Drafting a cited answer…"}
+        </div>
+        <div className="space-y-2.5 rounded-2xl border bg-card p-5 shadow-card">
+          <Skeleton className="h-3.5 w-11/12" />
+          <Skeleton className="h-3.5 w-full" />
+          <Skeleton className="h-3.5 w-4/5" />
+          <Skeleton className="h-3.5 w-2/3" />
+        </div>
+        <div className="flex gap-2">
+          <Skeleton className="h-14 flex-1 rounded-xl" />
+          <Skeleton className="h-14 flex-1 rounded-xl" />
+          <Skeleton className="hidden h-14 flex-1 rounded-xl sm:block" />
         </div>
       </div>
     </div>
   );
 }
 
-/* ─── Sub-components ────────────────────────────────────────────────── */
+function AssistantAvatar() {
+  return (
+    <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emblem text-accent shadow-card">
+      <Scale className="h-4 w-4" />
+    </div>
+  );
+}
+
+/* ─── Progressive reveal ("streaming" presentation of the full answer) ─ */
+
+function useReveal(text: string, active: boolean, onDone: () => void) {
+  const reduced = usePrefersReducedMotion();
+  const [count, setCount] = useState(active ? 0 : text.length);
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
+
+  useEffect(() => {
+    if (!active) {
+      setCount(text.length);
+      return;
+    }
+    if (reduced) {
+      setCount(text.length);
+      doneRef.current();
+      return;
+    }
+    // Finish within ~1.6s regardless of length.
+    const step = Math.max(3, Math.ceil(text.length / 95));
+    let n = 0;
+    let raf = 0;
+    const tick = () => {
+      n = Math.min(text.length, n + step);
+      setCount(n);
+      if (n < text.length) raf = requestAnimationFrame(tick);
+      else doneRef.current();
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [text, active, reduced]);
+
+  return text.slice(0, count);
+}
+
+/* ─── Turn ──────────────────────────────────────────────────────────── */
 
 function TurnView({
   turn,
+  index,
+  focusedN,
+  onCite,
   onSimplify,
   onToggleVariant,
   onFeedback,
+  onRetry,
+  onRevealDone,
 }: {
   turn: Turn;
+  index: number;
+  focusedN: number | null;
+  onCite: (n: number) => void;
   onSimplify: () => void;
   onToggleVariant: () => void;
   onFeedback: (fb: Turn["feedback"]) => void;
+  onRetry: () => void;
+  onRevealDone: () => void;
 }) {
+  const displayed = turn.showSimplified && turn.simplified ? turn.simplified : turn.content;
+  const shown = useReveal(displayed, Boolean(turn.revealing), onRevealDone);
+
   if (turn.role === "user") {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-primary px-4 py-3 text-sm text-primary-foreground shadow-sm">
+      <div className="flex animate-fade-up justify-end">
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-4 py-3 text-[15px] leading-relaxed text-primary-foreground shadow-card">
           {turn.content}
         </div>
       </div>
     );
   }
 
-  const displayed =
-    turn.showSimplified && turn.simplified ? turn.simplified : turn.content;
+  const citations = turn.citations ?? [];
+
+  if (turn.error) {
+    return (
+      <div className="flex animate-fade-up items-start gap-3">
+        <AssistantAvatar />
+        <div
+          role="alert"
+          className="flex flex-1 flex-wrap items-center gap-3 rounded-2xl border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{turn.content}</span>
+          <button
+            onClick={onRetry}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/30 bg-card px-3 py-1.5 text-xs font-medium text-foreground transition hover:border-destructive"
+          >
+            <RotateCcw className="h-3.5 w-3.5" /> Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(displayed);
+      toast("Answer copied to clipboard.");
+    } catch {
+      toast("Couldn't access the clipboard.", "error");
+    }
+  }
 
   return (
-    <div className="space-y-4">
+    <div className="animate-fade-up space-y-4">
       <div className="flex items-start gap-3">
-        <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emblem text-accent">
-          <Scale className="h-4 w-4" />
-        </div>
-        <div className="flex-1 space-y-3">
-          {turn.error && !turn.content ? (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-              {turn.error}
-            </div>
-          ) : (
-            <>
-              <div className="rounded-xl border bg-card p-4 text-sm leading-relaxed text-foreground shadow-sm">
-                {turn.showSimplified && turn.simplified && (
-                  <div className="mb-2 inline-flex items-center gap-1 rounded-full bg-accent/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-accent">
-                    <Wand2 className="h-3 w-3" /> Explained simply
-                  </div>
-                )}
-                <FormattedAnswer text={displayed} />
-              </div>
+        <AssistantAvatar />
+        <div className="min-w-0 flex-1 space-y-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span className="font-semibold text-foreground">NyayaGPT</span>
+            {citations.length > 0 && <span>· {citations.length} sources</span>}
+            {typeof turn.confidence === "number" && turn.confidence > 0 && (
+              <Tooltip label="Retrieval confidence (keyword + semantic match strength)">
+                <span className="inline-flex items-center gap-1.5 rounded-full border bg-card px-2 py-0.5">
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 rounded-full",
+                      turn.confidence >= 0.75 ? "bg-success" : turn.confidence >= 0.5 ? "bg-gold" : "bg-destructive"
+                    )}
+                  />
+                  {Math.round(turn.confidence * 100)}% confidence
+                </span>
+              </Tooltip>
+            )}
+            {turn.showSimplified && turn.simplified && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-gold/40 bg-gold-soft px-2 py-0.5 font-semibold text-gold-ink">
+                <Wand2 className="h-3 w-3" /> Explained simply
+              </span>
+            )}
+          </div>
 
-              {/* Action row */}
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                {typeof turn.confidence === "number" &&
-                  turn.confidence > 0 && (
-                    <span className="inline-flex items-center gap-1 rounded-full border bg-card px-2 py-1 text-foreground">
-                      <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-                      Confidence {Math.round(turn.confidence * 100)}%
-                    </span>
-                  )}
-                <button
-                  onClick={
-                    turn.simplified ? onToggleVariant : onSimplify
-                  }
-                  disabled={turn.simplifying}
-                  className="inline-flex items-center gap-1 rounded-full border bg-card px-2.5 py-1 text-foreground transition hover:border-gold disabled:opacity-50"
-                >
-                  {turn.simplifying ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                  ) : (
-                    <Wand2 className="h-3 w-3" />
-                  )}
-                  {turn.simplified
+          <div className="rounded-2xl rounded-tl-md border bg-card px-5 py-4 shadow-card">
+            <AnswerMarkdown
+              text={shown}
+              citations={citations}
+              onCite={onCite}
+              caret={turn.revealing}
+            />
+          </div>
+
+          {/* Action row */}
+          {!turn.revealing && (
+            <div className="flex animate-fade-in flex-wrap items-center gap-1.5 text-xs">
+              <button
+                onClick={turn.simplified ? onToggleVariant : onSimplify}
+                disabled={turn.simplifying}
+                className="inline-flex items-center gap-1.5 rounded-lg border bg-card px-2.5 py-1.5 font-medium text-foreground transition hover:border-gold disabled:opacity-50"
+              >
+                {turn.simplifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5 text-gold-ink" />}
+                {turn.simplifying
+                  ? "Simplifying…"
+                  : turn.simplified
                     ? turn.showSimplified
                       ? "Show original"
                       : "Show simplified"
                     : "Explain simply"}
-                </button>
+              </button>
+              <IconAction label="Copy answer" onClick={copy}>
+                <Copy className="h-3.5 w-3.5" />
+              </IconAction>
 
-                <div className="ml-auto flex items-center gap-1">
-                  <FeedbackBtn
-                    active={turn.feedback === "up"}
-                    onClick={() =>
-                      onFeedback(turn.feedback === "up" ? undefined : "up")
-                    }
-                    label="Helpful"
-                  >
-                    <ThumbsUp className="h-3 w-3" />
-                  </FeedbackBtn>
-                  <FeedbackBtn
-                    active={turn.feedback === "down"}
-                    onClick={() =>
-                      onFeedback(
-                        turn.feedback === "down" ? undefined : "down"
-                      )
-                    }
-                    label="Not helpful"
-                  >
-                    <ThumbsDown className="h-3 w-3" />
-                  </FeedbackBtn>
-                  <FeedbackBtn
-                    active={turn.feedback === "halluc"}
-                    onClick={() =>
-                      onFeedback(
-                        turn.feedback === "halluc" ? undefined : "halluc"
-                      )
-                    }
-                    label="Report hallucination"
-                  >
-                    <AlertTriangle className="h-3 w-3" />
-                  </FeedbackBtn>
-                </div>
+              <div className="ml-auto flex items-center gap-1">
+                <IconAction
+                  label="Helpful"
+                  active={turn.feedback === "up"}
+                  onClick={() => onFeedback(turn.feedback === "up" ? undefined : "up")}
+                >
+                  <ThumbsUp className="h-3.5 w-3.5" />
+                </IconAction>
+                <IconAction
+                  label="Not helpful"
+                  active={turn.feedback === "down"}
+                  onClick={() => onFeedback(turn.feedback === "down" ? undefined : "down")}
+                >
+                  <ThumbsDown className="h-3.5 w-3.5" />
+                </IconAction>
+                <IconAction
+                  label="Report hallucination"
+                  active={turn.feedback === "halluc"}
+                  onClick={() => onFeedback(turn.feedback === "halluc" ? undefined : "halluc")}
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                </IconAction>
               </div>
-            </>
+            </div>
           )}
         </div>
       </div>
 
-      {turn.citations && turn.citations.length > 0 && (
+      {citations.length > 0 && (
         <div className="ml-11 space-y-2">
-          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Sources used
           </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {turn.citations.map((c, i) => (
-              <div key={c.id} id={`cite-${c.id}`} className="scroll-mt-20">
-                <CitationCard index={i + 1} citation={c} />
-              </div>
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {citations.map((c, i) => (
+              <CitationCard
+                key={c.id}
+                domId={`cite-${index}-${i + 1}`}
+                index={i + 1}
+                citation={c}
+                highlighted={focusedN === i + 1}
+                compact
+              />
             ))}
           </div>
         </div>
       )}
 
       {turn.trace && (
-        <TracePanel
-          trace={turn.trace}
-          contextIds={turn.citations?.map((c) => c.id) ?? []}
-        />
+        <TracePanel trace={turn.trace} contextIds={citations.map((c) => c.id)} />
       )}
     </div>
+  );
+}
+
+function IconAction({
+  label,
+  onClick,
+  active,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  active?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip label={label}>
+      <button
+        onClick={onClick}
+        aria-label={label}
+        aria-pressed={active}
+        className={cn(
+          "inline-flex h-8 w-8 items-center justify-center rounded-lg border transition",
+          active
+            ? "border-gold bg-gold-soft text-gold-ink"
+            : "bg-card text-muted-foreground hover:border-gold hover:text-foreground"
+        )}
+      >
+        {children}
+      </button>
+    </Tooltip>
+  );
+}
+
+/* ─── Citations ─────────────────────────────────────────────────────── */
+
+function BookmarkButton({ citation }: { citation: Citation }) {
+  const hydrated = useHydrated();
+  const bookmarks = useWorkspaceStore((s) => s.bookmarks);
+  const addBookmark = useWorkspaceStore((s) => s.addBookmark);
+  const removeBookmark = useWorkspaceStore((s) => s.removeBookmark);
+  const saved = hydrated && bookmarks.some((b) => b.id === citation.id);
+
+  return (
+    <Tooltip label={saved ? "Remove bookmark" : "Bookmark section"}>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          if (saved) {
+            removeBookmark(citation.id);
+            toast("Bookmark removed.", "info");
+          } else {
+            addBookmark({
+              id: citation.id,
+              doc: citation.doc,
+              act: citation.act,
+              section: citation.section,
+              excerpt: citation.excerpt,
+              savedAt: new Date().toLocaleDateString(),
+            });
+            toast("Section bookmarked to your Workspace.");
+          }
+        }}
+        aria-label={saved ? "Remove bookmark" : "Bookmark section"}
+        aria-pressed={saved}
+        className={cn(
+          "inline-flex h-7 w-7 items-center justify-center rounded-md transition",
+          saved ? "text-gold-ink" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+        )}
+      >
+        {saved ? <BookmarkCheck className="h-3.5 w-3.5" /> : <Bookmark className="h-3.5 w-3.5" />}
+      </button>
+    </Tooltip>
   );
 }
 
 function CitationCard({
+  domId,
   index,
   citation,
+  highlighted,
+  compact = false,
+  onSelect,
 }: {
+  domId?: string;
   index: number;
   citation: Citation;
+  highlighted?: boolean;
+  compact?: boolean;
+  onSelect?: () => void;
 }) {
+  const [open, setOpen] = useState(!compact);
+
+  // Expand when a matching [n] badge is clicked in the answer.
+  useEffect(() => {
+    if (highlighted) setOpen(true);
+  }, [highlighted]);
+
   return (
-    <div className="rounded-lg border bg-card p-3 text-xs transition hover:border-gold">
-      <div className="flex items-center gap-2">
-        <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-accent-foreground">
-          {index}
-        </span>
-        <span className="font-semibold text-foreground">
-          {citation.act ?? citation.doc}
-        </span>
-      </div>
-      <div className="mt-1 font-medium text-foreground">{citation.section}</div>
-      <p className="mt-2 border-l-2 border-gold pl-2 text-muted-foreground line-clamp-3">
-        {citation.excerpt}
-      </p>
-      {citation.url && (
-        <a
-          href={citation.url}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-2 inline-block text-accent hover:underline"
-        >
-          View source →
-        </a>
+    <div
+      id={domId}
+      className={cn(
+        "scroll-mt-24 rounded-xl border bg-card text-xs shadow-card transition",
+        highlighted ? "border-gold ring-2 ring-gold/40" : "hover:border-gold/70"
       )}
-    </div>
-  );
-}
-
-function FeedbackBtn({
-  active,
-  onClick,
-  label,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      title={label}
-      className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition ${
-        active
-          ? "border-gold bg-accent/15 text-accent"
-          : "bg-card text-muted-foreground hover:border-gold hover:text-foreground"
-      }`}
     >
-      {children}
-    </button>
-  );
-}
+      <div className="flex items-start gap-2 p-3">
+        <button
+          onClick={() => {
+            setOpen((o) => !o);
+            onSelect?.();
+          }}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-start gap-2.5 text-left"
+        >
+          <span className="mt-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-accent px-1 text-[10px] font-bold text-accent-foreground">
+            {index}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate font-semibold text-foreground">
+              {citation.act ?? citation.doc}
+            </span>
+            <span className={cn("mt-0.5 block text-muted-foreground", !open && "truncate")}>
+              {citation.section}
+            </span>
+          </span>
+          <ChevronDown
+            className={cn("mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground transition", open && "rotate-180")}
+          />
+        </button>
+        <BookmarkButton citation={citation} />
+      </div>
 
-function TracePanel({
-  trace,
-  contextIds,
-}: {
-  trace: RetrievalTrace;
-  contextIds: string[];
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="ml-11">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center gap-1 text-xs text-muted-foreground transition hover:text-foreground"
-      >
-        {open ? (
-          <ChevronDown className="h-3 w-3" />
-        ) : (
-          <ChevronRight className="h-3 w-3" />
-        )}
-        How this answer was generated
-      </button>
       {open && (
-        <div className="mt-2 space-y-3 rounded-lg border bg-card/60 p-3 text-xs">
-          <TraceRow
-            label={`Retrieved: ${trace.retrieved.length}`}
-            items={trace.retrieved}
-          />
-          <TraceRow
-            label={`After reranking: ${trace.reranked.length}`}
-            items={trace.reranked}
-          />
-          <TraceRow
-            label={`Generation context: ${contextIds.length}`}
-            items={trace.reranked.filter((r) => contextIds.includes(r.id))}
-          />
+        <div className="animate-fade-in border-t px-3 pb-3 pt-2.5">
+          <p className="border-l-2 border-gold pl-2.5 leading-relaxed text-muted-foreground">
+            {citation.excerpt}
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            {citation.year && <span>{citation.year}</span>}
+            <ScoreChip label="Keyword" value={citation.bm25} pct={((citation.bm25 ?? 0) / 8) * 100} title="BM25 keyword score" />
+            <ScoreChip
+              label="Semantic"
+              value={citation.vector}
+              pct={((citation.vector ?? 0) - 0.775) / 0.1 * 100}
+              title="Vector cosine similarity"
+            />
+            {citation.url && (
+              <a
+                href={citation.url}
+                target="_blank"
+                rel="noreferrer"
+                className="ml-auto inline-flex items-center gap-1 font-medium text-gold-ink hover:underline"
+              >
+                Official source <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function TraceRow({
+function SourcesPanel({
+  turn,
+  turnIdx,
+  isLatest,
+  focusedN,
+  loading,
+  onSelect,
+  onShowLatest,
+}: {
+  turn?: Turn;
+  turnIdx: number | null;
+  isLatest: boolean;
+  focusedN: number | null;
+  loading: boolean;
+  onSelect: (n: number) => void;
+  onShowLatest: () => void;
+}) {
+  const citations = turn?.citations ?? [];
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex items-center justify-between gap-2 border-b px-5 py-4">
+        <div className="flex items-center gap-2">
+          <BookOpen className="h-4 w-4 text-gold-ink" />
+          <h2 className="font-sans text-xs font-semibold uppercase tracking-wider text-foreground">
+            Sources
+          </h2>
+          {citations.length > 0 && (
+            <span className="rounded-full bg-gold-soft px-1.5 text-[11px] font-semibold text-gold-ink">
+              {citations.length}
+            </span>
+          )}
+        </div>
+        {!isLatest && turnIdx !== null && (
+          <button onClick={onShowLatest} className="text-[11px] font-medium text-gold-ink hover:underline">
+            Show latest
+          </button>
+        )}
+      </div>
+
+      <div className="scrollbar-thin flex-1 space-y-2.5 overflow-y-auto overflow-x-hidden p-4">
+        {loading && isLatest ? (
+          <>
+            <Skeleton className="h-20 w-full rounded-xl" />
+            <Skeleton className="h-20 w-full rounded-xl" />
+            <Skeleton className="h-20 w-full rounded-xl" />
+          </>
+        ) : citations.length === 0 ? (
+          <div className="rounded-xl border border-dashed p-5 text-center text-xs text-muted-foreground">
+            <BookOpen className="mx-auto mb-2 h-5 w-5 text-muted-foreground/60" />
+            Retrieved sections will appear here after you ask a question.
+            <Link href="/library" className="mt-3 block font-medium text-gold-ink hover:underline">
+              Browse the library →
+            </Link>
+          </div>
+        ) : (
+          citations.map((c, i) => (
+            <CitationCard
+              key={`${turnIdx}-${c.id}`}
+              index={i + 1}
+              citation={c}
+              highlighted={focusedN === i + 1}
+              compact={focusedN !== i + 1}
+              onSelect={() => onSelect(i + 1)}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Retrieval trace ───────────────────────────────────────────────── */
+
+function TracePanel({ trace, contextIds }: { trace: RetrievalTrace; contextIds: string[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="ml-11">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="inline-flex items-center gap-1 rounded-md text-xs text-muted-foreground transition hover:text-foreground"
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        How this answer was generated
+      </button>
+      {open && (
+        <div className="mt-2 animate-fade-in rounded-xl border bg-card/70 p-4 text-xs">
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-muted-foreground">
+            <span
+              className={cn(
+                "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                trace.mode === "hybrid" ? "border-success/30 bg-success/10 text-success" : "border-gold/40 bg-gold-soft text-gold-ink"
+              )}
+            >
+              {trace.mode === "hybrid" ? "Hybrid retrieval" : "BM25 only"}
+            </span>
+            {trace.mode === "hybrid"
+              ? "Keyword and semantic results merged with Reciprocal Rank Fusion."
+              : "Semantic search was unavailable for this request, so keyword search was used."}
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <TraceRow step={1} label={`Keyword · ${trace.bm25.length}`} items={trace.bm25} />
+            <TraceRow step={2} label={`Semantic · ${trace.vector.length}`} items={trace.vector} />
+            <TraceRow step={3} label={`Fused · ${trace.topRanked.length}`} items={trace.topRanked} />
+            <TraceRow
+              step={4}
+              label={`Sent to LLM · ${contextIds.length}`}
+              items={trace.topRanked.filter((r) => contextIds.includes(r.id))}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScoreChip({
   label,
-  items,
+  value,
+  pct,
+  title,
 }: {
   label: string;
-  items: RetrievalStep[];
+  value?: number;
+  pct: number;
+  title: string;
 }) {
+  if (value === undefined) return null;
   return (
-    <div>
-      <div className="mb-1 font-semibold uppercase tracking-wider text-muted-foreground">
+    <span className="inline-flex items-center gap-1.5" title={title}>
+      {label}
+      <span className="h-1 w-10 overflow-hidden rounded-full bg-muted">
+        <span
+          className="block h-full rounded-full bg-gold"
+          style={{ width: `${Math.max(4, Math.min(100, pct))}%` }}
+        />
+      </span>
+      <span className="font-mono">{value}</span>
+    </span>
+  );
+}
+
+function TraceRow({ step, label, items }: { step: number; label: string; items: RetrievalStep[] }) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 flex items-center gap-1.5 font-semibold uppercase tracking-wider text-muted-foreground">
+        <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-gold-soft text-[9px] text-gold-ink">
+          {step}
+        </span>
         {label}
       </div>
       <ul className="space-y-1">
         {items.map((it) => (
           <li
             key={it.id}
-            className="flex items-center justify-between gap-3 rounded border bg-background px-2 py-1"
+            title={it.label}
+            className="flex items-center justify-between gap-2 rounded-md border bg-background px-2 py-1"
           >
             <span className="truncate text-foreground">{it.label}</span>
-            <span className="shrink-0 text-muted-foreground">{it.score}</span>
+            <span className="shrink-0 font-mono text-muted-foreground">{it.score}</span>
           </li>
         ))}
-        {items.length === 0 && (
-          <li className="text-muted-foreground">—</li>
-        )}
+        {items.length === 0 && <li className="text-muted-foreground">—</li>}
       </ul>
     </div>
-  );
-}
-
-function FormattedAnswer({ text }: { text: string }) {
-  const parts = text.split(/(\[\d+\])/g);
-  return (
-    <p className="whitespace-pre-wrap">
-      {parts.map((p, i) => {
-        const m = p.match(/^\[(\d+)\]$/);
-        if (m) {
-          return (
-            <a
-              key={i}
-              href={`#cite-idx-${m[1]}`}
-              onClick={(e) => {
-                e.preventDefault();
-                const cards = document.querySelectorAll('[id^="cite-"]');
-                const target = cards[
-                  parseInt(m[1], 10) - 1
-                ] as HTMLElement | undefined;
-                target?.scrollIntoView({
-                  behavior: "smooth",
-                  block: "center",
-                });
-                target?.classList.add("ring-2", "ring-gold");
-                setTimeout(
-                  () => target?.classList.remove("ring-2", "ring-gold"),
-                  1200
-                );
-              }}
-              className="mx-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-bold text-accent-foreground transition hover:opacity-80"
-            >
-              {m[1]}
-            </a>
-          );
-        }
-        return <span key={i}>{p}</span>;
-      })}
-    </p>
   );
 }

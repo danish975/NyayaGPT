@@ -18,13 +18,23 @@ export type BookmarkedLaw = {
   savedAt: string;
 };
 
+export type HistoryEntry = {
+  query: string;
+  at: string;
+};
+
+const MAX_HISTORY = 25;
+
 interface WorkspaceState {
   savedChats: SavedChat[];
   bookmarks: BookmarkedLaw[];
+  history: HistoryEntry[];
   addChat: (chat: SavedChat) => void;
   removeChat: (id: string) => void;
   addBookmark: (bookmark: BookmarkedLaw) => void;
   removeBookmark: (id: string) => void;
+  addHistory: (query: string) => void;
+  clearHistory: () => void;
   clearAll: () => void;
 }
 
@@ -33,6 +43,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
     (set) => ({
       savedChats: [],
       bookmarks: [],
+      history: [],
       addChat: (chat) =>
         set((state) => ({
           savedChats: [chat, ...state.savedChats.filter((c) => c.id !== chat.id)],
@@ -49,7 +60,15 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         set((state) => ({
           bookmarks: state.bookmarks.filter((b) => b.id !== id),
         })),
-      clearAll: () => set({ savedChats: [], bookmarks: [] }),
+      addHistory: (query) =>
+        set((state) => ({
+          history: [
+            { query, at: new Date().toISOString() },
+            ...state.history.filter((h) => h.query !== query),
+          ].slice(0, MAX_HISTORY),
+        })),
+      clearHistory: () => set({ history: [] }),
+      clearAll: () => set({ savedChats: [], bookmarks: [], history: [] }),
     }),
     { name: "nyayagpt-workspace" }
   )
