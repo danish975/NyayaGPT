@@ -10,7 +10,11 @@ import { CORPUS } from "@/data/corpus";
  */
 
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "Xenova/multilingual-e5-small";
-const CACHE_DIR = process.env.EMBEDDING_CACHE_DIR || `${process.cwd()}/.cache/models`;
+// Serverless platforms (Vercel, AWS Lambda) only allow writes under /tmp.
+const SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const CACHE_DIR =
+  process.env.EMBEDDING_CACHE_DIR ||
+  (SERVERLESS ? "/tmp/nyayagpt-models" : `${process.cwd()}/.cache/models`);
 const RETRY_AFTER_MS = 5 * 60_000;
 
 export type EmbeddingStatus = "idle" | "loading" | "ready" | "failed";

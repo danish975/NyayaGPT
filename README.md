@@ -92,6 +92,12 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000)
 
+### Deploying to Vercel
+
+- Set the project **Root Directory** to `frontend`, and add `GROQ_API_KEY`, `ADMIN_PASSWORD` and `SESSION_SECRET` as environment variables.
+- `next.config.ts` trims the ONNX runtime to the build platform's binary, keeping the `/api/chat` function well under Vercel's 250 MB limit (about 70 MB on linux/x64).
+- Vercel's filesystem is read-only except `/tmp`, so the embedding model is cached in `/tmp` and re-downloaded (~120 MB) on each cold start. Until it's ready, requests fall back to BM25 (the trace shows "BM25 only"). For consistently warm hybrid retrieval, use Docker or a long-running Node host — or set `HYBRID_RETRIEVAL=off` to always use BM25.
+
 ### With Docker
 
 ```bash
