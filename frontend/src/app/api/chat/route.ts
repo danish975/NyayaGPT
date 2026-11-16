@@ -1,4 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
+import { buildContext, NO_MATCH_ANSWER } from "@/lib/rag";
+import { enforceRateLimit } from "@/lib/rate-limit";
+import { getSecret, hmacSign } from "@/lib/crypto";
+import { groqChat, GroqError } from "@/lib/groq";
 
 const SYSTEM_PROMPT = `You are NyayaGPT, a careful assistant for Indian law, public policy, welfare schemes, and constitutional provisions.
 
@@ -9,64 +13,93 @@ Rules:
 - Detect the user's language (English, Hindi, Punjabi, etc.) and reply in the SAME language.
 - Never invent section numbers, dates, or quotes.`;
 
-export async function POST(request: NextRequest) {
-  try {
-    const { question, sources } = await request.json();
+const MAX_QUESTION_CHARS = 1000;
 
-    if (!question || !sources) {
+/** Signs an answer so /api/simplify only accepts text this server produced. */
+async function signAnswer(answer: string): Promise<string | undefined> {
+  const secret = getSecret();
+  return secret ? hmacSign(`answer:${answer}`, secret) : undefined;
+}
+
+export async function POST(request: NextRequest) {
+  const limited = enforceRateLimit(request, {
+    name: "chat",
+    perIp: 20,
+    global: 300,
+    windowMs: 60_000,
+  });
+  if (limited) return limited;
+
+  try {
+    const body = await request.json().catch(() => null);
+    const question = typeof body?.question === "string" ? body.question.trim() : "";
+
+    if (!question) {
+      return NextResponse.json({ error: "Question is required." }, { status: 400 });
+    }
+    if (question.length > MAX_QUESTION_CHARS) {
       return NextResponse.json(
-        { error: "Question and sources are required" },
+        { error: `Question is too long (max ${MAX_QUESTION_CHARS} characters).` },
         { status: 400 }
       );
+    }
+
+    // Retrieval happens here on the server: the client cannot choose the sources.
+    const { chunks, trace, citations, sources, confidence } = await buildContext(question);
+
+    if (chunks.length === 0) {
+      return NextResponse.json({
+        answer: NO_MATCH_ANSWER,
+        answerToken: await signAnswer(NO_MATCH_ANSWER),
+        citations: [],
+        confidence: 0,
+        trace,
+      });
     }
 
     const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) {
       // Fallback: generate a mock answer using the sources
+      const answer = generateMockAnswer(question, sources);
       return NextResponse.json({
-        answer: generateMockAnswer(question, sources),
+        answer,
+        answerToken: await signAnswer(answer),
+        citations,
+        confidence,
+        trace,
         mock: true,
       });
     }
 
     const userPrompt = `QUESTION:\n${question}\n\nSOURCES:\n${sources}\n\nAnswer the question using only the sources above. Use [n] citations inline.`;
 
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.3,
-        max_tokens: 1024,
-      }),
-    });
-
-    if (!res.ok) {
-      if (res.status === 429) {
+    let answer: string;
+    try {
+      answer = await groqChat({ apiKey, system: SYSTEM_PROMPT, user: userPrompt, temperature: 0.3 });
+    } catch (err) {
+      if (err instanceof GroqError) {
+        if (err.status === 429) {
+          return NextResponse.json(
+            { error: "Rate limit reached. Please try again in a moment." },
+            { status: 429 }
+          );
+        }
+        console.error("Groq API error:", err.status, err.body);
         return NextResponse.json(
-          { error: "Rate limit reached. Please try again in a moment." },
-          { status: 429 }
+          { error: "The AI service returned an error. Please try again." },
+          { status: 502 }
         );
       }
-      const text = await res.text();
-      console.error("Groq API error:", res.status, text);
-      return NextResponse.json(
-        { error: "The AI service returned an error. Please try again." },
-        { status: 500 }
-      );
+      throw err;
     }
 
-    const json = await res.json();
-    const answer = json?.choices?.[0]?.message?.content ?? "";
-
-    return NextResponse.json({ answer });
+    return NextResponse.json({
+      answer,
+      answerToken: await signAnswer(answer),
+      citations,
+      confidence,
+      trace,
+    });
   } catch (error) {
     console.error("Chat API error:", error);
     return NextResponse.json(
@@ -90,19 +123,19 @@ function generateMockAnswer(question: string, sources: string): string {
   }
 
   if (q.includes("pmay") || q.includes("housing") || q.includes("awas")) {
-    return `Under PMAY-U (Pradhan Mantri Awas Yojana - Urban), eligibility is based on household income [1]:\n\n• **EWS**: Annual income up to ₹3 lakh — 6.5% interest subsidy on loan up to ₹6 lakh [1]\n• **LIG**: Annual income ₹3–6 lakh — 6.5% interest subsidy on loan up to ₹6 lakh [1]\n• **MIG-I**: Annual income ₹6–12 lakh — 4% interest subsidy on loan up to ₹9 lakh [1]\n• **MIG-II**: Annual income ₹12–18 lakh — 3% interest subsidy on loan up to ₹12 lakh [1]\n\nPreference is given to women ownership especially under EWS and LIG categories [1].`;
+    return `Under PMAY-U 2.0 (approved in 2024), eligibility is based on annual household income [1]:\n\n• **EWS**: up to ₹3 lakh\n• **LIG**: ₹3–6 lakh\n• **MIG**: ₹6–9 lakh [1]\n\nThe family must not own a pucca house anywhere in India [1]. Under the Interest Subsidy Scheme, eligible EWS/LIG/MIG families get a 4% interest subsidy on the first ₹8 lakh of a home loan up to ₹25 lakh (house value up to ₹35 lakh), up to ₹1.8 lakh in total [1].\n\nThe earlier Credit Linked Subsidy Scheme (CLSS) under PMAY-U (2015) is closed to new applicants [2].`;
   }
 
   if (q.includes("mgnrega") || q.includes("nrega") || q.includes("100 days")) {
-    return `MGNREGA guarantees **100 days of unskilled manual work** per financial year to every rural household whose adult members volunteer [1].\n\nKey provisions:\n• If employment is not provided within **15 days**, the applicant is entitled to an unemployment allowance [1]\n• **Wages must be paid within 15 days** of the date work was done [1]\n• Permissible works include water conservation, drought proofing, irrigation, rural connectivity, and land development [2]`;
+    return `MGNREGA guarantees **at least 100 days of unskilled manual work** per financial year to every rural household whose adult members volunteer [1].\n\nKey provisions:\n• If employment is not provided within **15 days** of the application, the applicant is entitled to a daily unemployment allowance [1]\n• Wages must be paid weekly, and **in any case within 15 days** of the date work was done [1]\n• Permissible works include water conservation, drought proofing, irrigation, rural connectivity, and land development [2]`;
   }
 
   if (q.includes("dpdp") || q.includes("data protection") || q.includes("consent")) {
-    return `The Digital Personal Data Protection Act, 2023 establishes that consent must be **free, specific, informed, unconditional and unambiguous** with a clear affirmative action [1]. Key provisions:\n\n• Consent can be **withdrawn at any point** [1]\n• Data Fiduciaries must provide a **notice before obtaining consent** describing the personal data to be collected and purpose of processing [1]\n• Data Principals have the right to obtain a **summary of their personal data** being processed [2]\n• Special protections exist for **children's data** — verifiable parental consent is required [3]`;
+    return `The Digital Personal Data Protection Act, 2023 establishes that consent must be **free, specific, informed, unconditional and unambiguous** with a clear affirmative action [1]. Key provisions:\n\n• Consent can be **withdrawn at any time** [1]\n• Data Fiduciaries must give a **notice before or when asking for consent**, describing the personal data and the purpose of processing [1]\n• Data Principals have the right to obtain a **summary of their personal data** being processed [2]\n• Special protections exist for **children's data** — verifiable parental consent is required [3]`;
   }
 
   if (q.includes("nep") || q.includes("education policy") || q.includes("शिक्षा")) {
-    return `NEP 2020 introduces a new **5+3+3+4 curricular structure** [1]:\n\n• **Foundational Stage** (age 3–8): 3 years pre-primary + Grades 1–2\n• **Preparatory Stage** (age 8–11): Grades 3–5\n• **Middle Stage** (age 11–14): Grades 6–8\n• **Secondary Stage** (age 14–18): Grades 9–12\n\nMother tongue or local language shall be the medium of instruction until at least Grade 5 [1]. Higher education will feature **multiple exit points**: Certificate (1 yr), Diploma (2 yrs), Bachelor's (3 yrs), Bachelor's with Research (4 yrs) [2].`;
+    return `NEP 2020 introduces a new **5+3+3+4 curricular structure** [1]:\n\n• **Foundational Stage** (age 3–8): 3 years pre-primary + Grades 1–2\n• **Preparatory Stage** (age 8–11): Grades 3–5\n• **Middle Stage** (age 11–14): Grades 6–8\n• **Secondary Stage** (age 14–18): Grades 9–12\n\nWherever possible, the mother tongue or local language should be the medium of instruction until at least Grade 5 [1]. Higher education will feature **multiple exit points**: Certificate (1 yr), Diploma (2 yrs), Bachelor's (3 yrs), Bachelor's with Research (4 yrs) [2].`;
   }
 
   // Generic fallback

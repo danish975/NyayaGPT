@@ -1,17 +1,22 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import Link from "next/link";
+import { useMemo, useRef, useState } from "react";
 import {
-  ArrowLeft,
+  AlertCircle,
   BadgeCheck,
+  CheckCircle2,
+  ChevronDown,
+  CircleSlash,
   ExternalLink,
   FileCheck2,
-  Scale,
+  Info,
   Sparkles,
 } from "lucide-react";
-import { DarkModeToggle } from "@/components/ui/DarkModeToggle";
+import { Header } from "@/components/layout/Header";
+import { Footer } from "@/components/layout/Footer";
+import { PageHeader, buttonStyles, inputStyles } from "@/components/ui/primitives";
 import { CORPUS } from "@/data/corpus";
+import { cn } from "@/lib/utils";
 
 type Gender = "female" | "male" | "other";
 type Occupation =
@@ -51,7 +56,7 @@ type Scheme = {
 const SCHEMES: Scheme[] = [
   {
     id: "pmay-u",
-    name: "Pradhan Mantri Awas Yojana (Urban)",
+    name: "Pradhan Mantri Awas Yojana (Urban) 2.0",
     ministry: "Ministry of Housing & Urban Affairs",
     documents: [
       "Aadhaar",
@@ -60,40 +65,37 @@ const SCHEMES: Scheme[] = [
       "Affidavit of no pucca house",
     ],
     source: { label: "pmay-urban.gov.in", url: "https://pmay-urban.gov.in/" },
-    corpusId: "pmay-elig",
+    corpusId: "pmay2-elig",
     rule: (p) => {
-      const reasons: string[] = [];
-      let conf = 0.4;
-      if (p.income <= 1_800_000) {
-        if (p.income <= 300_000) {
-          reasons.push("Income ≤ ₹3L qualifies you for EWS slab");
-          conf += 0.35;
-        } else if (p.income <= 600_000) {
-          reasons.push("Income in ₹3–6L bracket → LIG slab");
-          conf += 0.3;
-        } else if (p.income <= 1_200_000) {
-          reasons.push("Income in ₹6–12L bracket → MIG-I slab");
-          conf += 0.2;
-        } else {
-          reasons.push("Income in ₹12–18L bracket → MIG-II slab");
-          conf += 0.15;
-        }
-      } else {
+      if (p.income > 900_000) {
         return {
           eligible: false,
-          reasons: ["Income above ₹18L exceeds MIG-II ceiling"],
+          reasons: ["Income above ₹9L exceeds the PMAY-U 2.0 MIG ceiling"],
           confidence: 0.9,
         };
       }
+      const reasons: string[] = [];
+      let conf = 0.4;
+      if (p.income <= 300_000) {
+        reasons.push("Income ≤ ₹3L → EWS category");
+        conf += 0.3;
+      } else if (p.income <= 600_000) {
+        reasons.push("Income in ₹3–6L bracket → LIG category");
+        conf += 0.25;
+      } else {
+        reasons.push("Income in ₹6–9L bracket → MIG category (Interest Subsidy Scheme)");
+        conf += 0.2;
+      }
+      reasons.push("Your family must not own a pucca house anywhere in India");
       if (p.gender === "female") {
-        reasons.push("Female ownership preference under EWS/LIG");
-        conf += 0.1;
+        reasons.push("Houses are preferably in the name of the woman head of the family or held jointly");
+        conf += 0.05;
       }
       if (p.age >= 18) {
         conf += 0.05;
         reasons.push("Adult applicant");
       }
-      return { eligible: true, reasons, confidence: Math.min(conf, 0.95) };
+      return { eligible: true, reasons, confidence: Math.min(conf, 0.9) };
     },
   },
   {
@@ -159,15 +161,14 @@ const SCHEMES: Scheme[] = [
           reasons: ["Applicant must be an adult land-owner"],
           confidence: 0.9,
         };
-      const reasons = [
-        "Landholding farmer family — eligible for ₹6,000 annual income support",
-      ];
-      let conf = 0.75;
-      if (p.income <= 600_000) {
-        reasons.push("Below typical exclusion thresholds");
-        conf += 0.1;
-      }
-      return { eligible: true, reasons, confidence: Math.min(conf, 0.9) };
+      return {
+        eligible: true,
+        reasons: [
+          "Landholding farmer family — eligible for ₹6,000 annual income support",
+          "Excluded if any family member paid income tax in the last assessment year, holds or held a constitutional post, is a serving or retired government employee (except Group D / MTS), draws a pension of ₹10,000+/month, or is a practising professional such as a doctor, lawyer or CA",
+        ],
+        confidence: 0.75,
+      };
     },
   },
   {
@@ -181,7 +182,17 @@ const SCHEMES: Scheme[] = [
       "Mobile number",
     ],
     source: { label: "pmjay.gov.in", url: "https://pmjay.gov.in/" },
+    corpusId: "ayush-eligibility",
     rule: (p) => {
+      if (p.age >= 70) {
+        return {
+          eligible: true,
+          reasons: [
+            "Since October 2024, every senior citizen aged 70+ is covered irrespective of income (Ayushman Vay Vandana card)",
+          ],
+          confidence: 0.95,
+        };
+      }
       const reasons: string[] = [];
       let conf = 0.3;
       if (p.income <= 250_000) {
@@ -291,7 +302,7 @@ const SCHEMES: Scheme[] = [
       url: "https://www.nsiindia.gov.in/InternalPage.aspx?Id_Pk=89",
     },
     rule: (p) => {
-      if (p.gender === "female" && p.age <= 10) {
+      if (p.gender === "female" && p.age < 10) {
         return {
           eligible: true,
           reasons: ["Girl child under 10 years can open SSY account"],
@@ -315,14 +326,14 @@ const SCHEMES: Scheme[] = [
       url: "https://www.pmkvyofficial.org/",
     },
     rule: (p) => {
-      if (p.age < 15 || p.age > 45)
+      if (p.age < 15 || p.age > 59)
         return {
           eligible: false,
-          reasons: ["Targets youth aged 15–45"],
+          reasons: ["PMKVY 4.0 is open to candidates aged 15–59"],
           confidence: 0.9,
         };
       const reasons = [
-        `Age ${p.age} falls in PMKVY target window (15–45)`,
+        `Age ${p.age} falls in the PMKVY 4.0 age range (15–59)`,
       ];
       let conf = 0.6;
       if (p.occupation === "unemployed" || p.occupation === "student") {
@@ -368,6 +379,10 @@ function formatINR(n: number) {
   }).format(n);
 }
 
+
+const MAX_INCOME_INPUT = 10_000_000;
+type ResultFilter = "all" | "eligible" | "ineligible";
+
 export default function EligibilityPage() {
   const [profile, setProfile] = useState<Profile>({
     state: "Maharashtra",
@@ -377,6 +392,26 @@ export default function EligibilityPage() {
     occupation: "self_employed",
   });
   const [submitted, setSubmitted] = useState(false);
+  const [ageInput, setAgeInput] = useState(String(profile.age));
+  const [incomeInput, setIncomeInput] = useState(String(profile.income));
+  const [filter, setFilter] = useState<ResultFilter>("all");
+  const resultsRef = useRef<HTMLElement>(null);
+
+  const ageError = (() => {
+    if (ageInput.trim() === "") return "Enter your age.";
+    const n = Number(ageInput);
+    if (!Number.isInteger(n)) return "Age must be a whole number.";
+    if (n < 0 || n > 120) return "Age must be between 0 and 120.";
+    return null;
+  })();
+
+  const incomeError = (() => {
+    if (incomeInput.trim() === "") return "Enter your annual household income.";
+    const n = Number(incomeInput);
+    if (!Number.isFinite(n) || n < 0) return "Income must be a positive amount.";
+    if (n > MAX_INCOME_INPUT) return "Enter an amount up to ₹1 crore.";
+    return null;
+  })();
 
   const results = useMemo(() => {
     return SCHEMES.map((s) => {
@@ -393,152 +428,137 @@ export default function EligibilityPage() {
   }, [profile]);
 
   const eligibleCount = results.filter((r) => r.eligible).length;
+  const shown = results.filter((r) =>
+    filter === "all" ? true : filter === "eligible" ? r.eligible : !r.eligible
+  );
+  const hasErrors = Boolean(ageError || incomeError);
 
   return (
     <div className="min-h-screen bg-background">
-      <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4">
-          <Link href="/" className="flex items-center gap-2">
-            <span className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-emblem text-accent">
-              <Scale className="h-5 w-5" />
-            </span>
-            <span className="font-display text-xl font-semibold text-foreground">
-              Nyaya<span className="text-gradient-gold">GPT</span>
-            </span>
-          </Link>
-          <div className="flex items-center gap-2">
-            <Link
-              href="/"
-              className="inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm text-muted-foreground transition hover:text-foreground"
-            >
-              <ArrowLeft className="h-4 w-4" /> Home
-            </Link>
-            <DarkModeToggle />
-          </div>
-        </div>
-      </header>
+      <Header />
 
-      <main className="mx-auto max-w-6xl px-4 py-10">
-        <div className="mb-8 max-w-3xl">
-          <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-gold/40 bg-gold-soft/40 px-3 py-1 text-xs font-medium">
-            <Sparkles className="h-3.5 w-3.5 text-accent" />
-            Rules + retrieval · Citation-aware
-          </div>
-          <h1 className="font-display text-4xl text-foreground sm:text-5xl">
-            Scheme Eligibility{" "}
-            <span className="text-gradient-gold">Checker</span>
-          </h1>
-          <p className="mt-3 text-muted-foreground">
-            Answer five quick questions. We combine a deterministic rules engine
-            with retrieval over official scheme guidelines to surface programmes
-            you likely qualify for — with reasons, documents, and the source you
-            can verify.
-          </p>
-        </div>
+      <main id="main" className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+        <PageHeader
+          eyebrow="Rules + retrieval · Citation-aware"
+          eyebrowIcon={<Sparkles className="h-3.5 w-3.5" />}
+          title="Scheme Eligibility"
+          highlight="Checker"
+          description="Answer five quick questions. A deterministic rules engine and the indexed scheme guidelines surface programmes you likely qualify for — with reasons, documents, and a source you can verify."
+        />
 
         <div className="grid gap-6 lg:grid-cols-[380px_1fr]">
           {/* Form */}
           <form
-            className="h-fit rounded-xl border bg-card p-5 shadow-sm"
+            noValidate
+            className="h-fit rounded-2xl border bg-card p-5 shadow-card sm:p-6 lg:sticky lg:top-24"
             onSubmit={(e) => {
               e.preventDefault();
+              if (hasErrors) return;
               setSubmitted(true);
+              if (window.innerWidth < 1024)
+                resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
             }}
           >
-            <h2 className="font-display text-lg text-foreground">
-              Your profile
-            </h2>
-            <p className="mb-4 text-xs text-muted-foreground">
-              Information stays in your browser.
+            <h2 className="font-display text-xl text-foreground">Your profile</h2>
+            <p className="mb-5 mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Info className="h-3.5 w-3.5" /> Information stays in your browser.
             </p>
 
-            <label className="mb-3 block">
-              <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                State
-              </span>
+            <Field label="State" htmlFor="state">
               <select
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                id="state"
+                className={inputStyles}
                 value={profile.state}
-                onChange={(e) =>
-                  setProfile({ ...profile, state: e.target.value })
-                }
+                onChange={(e) => setProfile({ ...profile, state: e.target.value })}
               >
                 {STATES.map((s) => (
                   <option key={s}>{s}</option>
                 ))}
               </select>
-            </label>
+            </Field>
 
-            <div className="mb-3 grid grid-cols-2 gap-3">
-              <label>
-                <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Age
-                </span>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Age" htmlFor="age" error={ageError}>
                 <input
+                  id="age"
                   type="number"
+                  inputMode="numeric"
                   min={0}
                   max={120}
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                  value={profile.age}
-                  onChange={(e) =>
-                    setProfile({ ...profile, age: Number(e.target.value) })
-                  }
+                  aria-invalid={Boolean(ageError)}
+                  aria-describedby={ageError ? "age-error" : undefined}
+                  className={cn(inputStyles, ageError && "border-destructive focus:border-destructive focus:ring-destructive/20")}
+                  value={ageInput}
+                  onChange={(e) => {
+                    setAgeInput(e.target.value);
+                    const n = Number(e.target.value);
+                    if (e.target.value.trim() !== "" && Number.isInteger(n) && n >= 0 && n <= 120)
+                      setProfile({ ...profile, age: n });
+                  }}
                 />
-              </label>
-              <label>
-                <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Gender
-                </span>
+              </Field>
+              <Field label="Gender" htmlFor="gender">
                 <select
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  id="gender"
+                  className={inputStyles}
                   value={profile.gender}
-                  onChange={(e) =>
-                    setProfile({
-                      ...profile,
-                      gender: e.target.value as Gender,
-                    })
-                  }
+                  onChange={(e) => setProfile({ ...profile, gender: e.target.value as Gender })}
                 >
                   <option value="female">Female</option>
                   <option value="male">Male</option>
                   <option value="other">Other</option>
                 </select>
-              </label>
+              </Field>
             </div>
 
-            <label className="mb-3 block">
-              <span className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
-                <span>Annual household income</span>
-                <span className="font-mono text-foreground">
-                  {formatINR(profile.income)}
-                </span>
-              </span>
+            <Field label="Annual household income" htmlFor="income" error={incomeError} hint={formatINR(profile.income)}>
+              <div className="relative">
+                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">₹</span>
+                <input
+                  id="income"
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  step={10_000}
+                  aria-invalid={Boolean(incomeError)}
+                  aria-describedby={incomeError ? "income-error" : undefined}
+                  className={cn(inputStyles, "pl-7", incomeError && "border-destructive focus:border-destructive focus:ring-destructive/20")}
+                  value={incomeInput}
+                  onChange={(e) => {
+                    setIncomeInput(e.target.value);
+                    const n = Number(e.target.value);
+                    if (e.target.value.trim() !== "" && Number.isFinite(n) && n >= 0 && n <= MAX_INCOME_INPUT)
+                      setProfile({ ...profile, income: n });
+                  }}
+                />
+              </div>
               <input
                 type="range"
+                aria-label="Annual household income slider"
                 min={0}
                 max={2_000_000}
                 step={10_000}
-                className="w-full accent-accent"
-                value={profile.income}
-                onChange={(e) =>
-                  setProfile({ ...profile, income: Number(e.target.value) })
-                }
+                className="mt-3 w-full cursor-pointer accent-[var(--gold)]"
+                value={Math.min(profile.income, 2_000_000)}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  setProfile({ ...profile, income: n });
+                  setIncomeInput(String(n));
+                }}
               />
-            </label>
+              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+                <span>₹0</span>
+                <span>₹10L</span>
+                <span>₹20L+</span>
+              </div>
+            </Field>
 
-            <label className="mb-4 block">
-              <span className="mb-1 block text-xs font-medium text-muted-foreground">
-                Occupation
-              </span>
+            <Field label="Occupation" htmlFor="occupation">
               <select
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                id="occupation"
+                className={inputStyles}
                 value={profile.occupation}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    occupation: e.target.value as Occupation,
-                  })
-                }
+                onChange={(e) => setProfile({ ...profile, occupation: e.target.value as Occupation })}
               >
                 <option value="farmer">Farmer (landholding)</option>
                 <option value="rural_labour">Rural labour</option>
@@ -549,127 +569,228 @@ export default function EligibilityPage() {
                 <option value="homemaker">Homemaker</option>
                 <option value="senior">Senior citizen</option>
               </select>
-            </label>
+            </Field>
 
-            <button
-              type="submit"
-              className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-            >
+            <button type="submit" disabled={hasErrors} className={cn(buttonStyles.primary, "mt-2 w-full py-3")}>
               <BadgeCheck className="h-4 w-4" /> Check eligibility
             </button>
-            {submitted && (
-              <p className="mt-3 text-center text-xs text-muted-foreground">
-                {eligibleCount} of {results.length} schemes match your profile.
+            {hasErrors && (
+              <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-destructive">
+                <AlertCircle className="h-3.5 w-3.5" /> Fix the highlighted fields to continue.
               </p>
             )}
           </form>
 
           {/* Results */}
-          <section className="space-y-4">
-            {results.map(({ scheme, eligible, reasons, confidence, chunk }) => (
-              <article
-                key={scheme.id}
-                className={`rounded-xl border bg-card p-5 shadow-sm transition ${
-                  eligible ? "" : "opacity-60"
-                }`}
-              >
-                <header className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                          eligible
-                            ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
-                            : "bg-muted text-muted-foreground"
-                        }`}
-                      >
-                        {eligible ? "Eligible" : "Not eligible"}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {scheme.ministry}
-                      </span>
-                    </div>
-                    <h3 className="mt-1 font-display text-lg text-foreground">
-                      {scheme.name}
-                    </h3>
-                  </div>
-                  <ConfidenceMeter value={confidence} />
-                </header>
-
-                <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <div>
-                    <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                      Why
-                    </h4>
-                    <ul className="space-y-1 text-sm text-foreground">
-                      {reasons.map((r, i) => (
-                        <li key={i} className="flex gap-2">
-                          <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
-                          <span>{r}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div>
-                    <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                      Required documents
-                    </h4>
-                    <ul className="space-y-1 text-sm text-foreground">
-                      {scheme.documents.map((d) => (
-                        <li key={d} className="flex gap-2">
-                          <FileCheck2 className="mt-0.5 h-4 w-4 shrink-0 text-accent" />
-                          <span>{d}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-
-                <footer className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t pt-3 text-xs">
-                  <a
-                    href={scheme.source.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 font-medium text-accent hover:underline"
+          <section ref={resultsRef} aria-labelledby="results-heading" className="scroll-mt-24 space-y-4">
+            <div className="flex flex-col gap-3 rounded-2xl border bg-card p-4 shadow-card sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h2 id="results-heading" className="font-display text-lg text-foreground">
+                  {submitted ? "Your results" : "Live preview"}
+                </h2>
+                <p className="text-sm text-muted-foreground" aria-live="polite">
+                  <span className="font-semibold text-foreground">{eligibleCount}</span> of {results.length} schemes match your profile.
+                </p>
+              </div>
+              <div role="tablist" aria-label="Filter results" className="flex gap-1 rounded-lg bg-muted p-1 text-xs">
+                {(
+                  [
+                    ["all", `All (${results.length})`],
+                    ["eligible", `Eligible (${eligibleCount})`],
+                    ["ineligible", `Not eligible (${results.length - eligibleCount})`],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    role="tab"
+                    aria-selected={filter === id}
+                    onClick={() => setFilter(id)}
+                    className={cn(
+                      "rounded-md px-2.5 py-1.5 font-medium transition",
+                      filter === id ? "bg-card text-foreground shadow-card" : "text-muted-foreground hover:text-foreground"
+                    )}
                   >
-                    Official source · {scheme.source.label}
-                    <ExternalLink className="h-3 w-3" />
-                  </a>
-                  {chunk && (
-                    <span className="text-muted-foreground">
-                      Retrieved:{" "}
-                      <span className="text-foreground">{chunk.doc}</span> ·{" "}
-                      {chunk.section}
-                    </span>
-                  )}
-                </footer>
-              </article>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {shown.map(({ scheme, eligible, reasons, confidence, chunk }) => (
+              <ResultCard
+                key={scheme.id}
+                scheme={scheme}
+                eligible={eligible}
+                reasons={reasons}
+                confidence={confidence}
+                chunk={chunk}
+              />
             ))}
           </section>
         </div>
 
-        <p className="mt-8 text-xs text-muted-foreground">
+        <p className="mt-10 flex items-start gap-2 rounded-xl border bg-card/60 p-4 text-xs text-muted-foreground">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           Disclaimer: This tool gives an indicative match using public scheme
           guidelines. Final eligibility is determined by the issuing authority.
           Always verify on the official portal.
         </p>
       </main>
+      <Footer />
     </div>
+  );
+}
+
+function Field({
+  label,
+  htmlFor,
+  error,
+  hint,
+  children,
+}: {
+  label: string;
+  htmlFor: string;
+  error?: string | null;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mb-4">
+      <label htmlFor={htmlFor} className="mb-1.5 flex items-center justify-between text-xs font-medium text-muted-foreground">
+        <span>{label}</span>
+        {hint && <span className="font-mono text-foreground">{hint}</span>}
+      </label>
+      {children}
+      {error && (
+        <p id={`${htmlFor}-error`} className="mt-1.5 flex items-center gap-1 text-xs text-destructive">
+          <AlertCircle className="h-3 w-3" /> {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ResultCard({
+  scheme,
+  eligible,
+  reasons,
+  confidence,
+  chunk,
+}: {
+  scheme: Scheme;
+  eligible: boolean;
+  reasons: string[];
+  confidence: number;
+  chunk?: (typeof CORPUS)[number];
+}) {
+  const [showSource, setShowSource] = useState(false);
+  return (
+    <article
+      className={cn(
+        "animate-fade-up overflow-hidden rounded-2xl border bg-card shadow-card transition hover:shadow-lift",
+        eligible ? "border-l-4 border-l-success" : "border-l-4 border-l-border"
+      )}
+    >
+      <div className="p-5 sm:p-6">
+        <header className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold",
+                  eligible ? "bg-success/10 text-success" : "bg-muted text-muted-foreground"
+                )}
+              >
+                {eligible ? <CheckCircle2 className="h-3.5 w-3.5" /> : <CircleSlash className="h-3.5 w-3.5" />}
+                {eligible ? "Likely eligible" : "Not eligible"}
+              </span>
+              <span className="text-xs text-muted-foreground">{scheme.ministry}</span>
+            </div>
+            <h3 className={cn("mt-2 font-display text-xl", eligible ? "text-foreground" : "text-muted-foreground")}>
+              {scheme.name}
+            </h3>
+          </div>
+          <ConfidenceMeter value={confidence} />
+        </header>
+
+        <div className={cn("mt-5 grid gap-5 sm:grid-cols-2", !eligible && "opacity-80")}>
+          <div>
+            <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Why</h4>
+            <ul className="space-y-1.5 text-sm text-foreground">
+              {reasons.map((r, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-gold" />
+                  <span>{r}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Required documents</h4>
+            <ul className="space-y-1.5 text-sm text-foreground">
+              {scheme.documents.map((d) => (
+                <li key={d} className="flex gap-2">
+                  <FileCheck2 className="mt-0.5 h-4 w-4 shrink-0 text-gold-ink" />
+                  <span>{d}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <footer className="border-t bg-parchment/50 px-5 py-3 text-xs sm:px-6">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <a
+            href={scheme.source.url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 font-medium text-gold-ink hover:underline"
+          >
+            Official source · {scheme.source.label}
+            <ExternalLink className="h-3 w-3" />
+          </a>
+          {chunk && (
+            <button
+              onClick={() => setShowSource((s) => !s)}
+              aria-expanded={showSource}
+              className="flex max-w-full items-center gap-1 text-left text-muted-foreground transition hover:text-foreground"
+            >
+              <span className="min-w-0">
+                Retrieved: <span className="font-medium text-foreground">{chunk.doc}</span> · {chunk.section}
+              </span>
+              <ChevronDown className={cn("h-3 w-3 shrink-0 transition", showSource && "rotate-180")} />
+            </button>
+          )}
+        </div>
+        {chunk && showSource && (
+          <p className="mt-3 animate-fade-in border-l-2 border-gold pl-3 leading-relaxed text-muted-foreground">
+            {chunk.text}
+          </p>
+        )}
+      </footer>
+    </article>
   );
 }
 
 function ConfidenceMeter({ value }: { value: number }) {
   const pct = Math.round(value * 100);
-  const tone =
-    pct >= 75 ? "bg-emerald-500" : pct >= 50 ? "bg-amber-500" : "bg-rose-500";
+  const tone = pct >= 75 ? "bg-success" : pct >= 50 ? "bg-gold" : "bg-destructive";
   return (
-    <div className="w-32 shrink-0">
-      <div className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+    <div className="w-36 shrink-0" title="Confidence of the rule-based match">
+      <div className="mb-1.5 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
         <span>Confidence</span>
         <span className="font-mono text-foreground">{pct}%</span>
       </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-        <div className={`h-full ${tone}`} style={{ width: `${pct}%` }} />
+      <div
+        className="h-2 w-full overflow-hidden rounded-full bg-muted"
+        role="meter"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+        aria-label="Confidence"
+      >
+        <div className={cn("h-full rounded-full transition-all duration-500", tone)} style={{ width: `${pct}%` }} />
       </div>
     </div>
   );

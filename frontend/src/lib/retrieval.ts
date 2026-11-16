@@ -12,7 +12,8 @@ function tokenize(s: string): string[] {
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .split(/\s+/)
-    .filter((t) => t.length > 1 && !STOP.has(t));
+    // Keep single digits: section/article numbers like "Section 8" matter in legal queries.
+    .filter((t) => (t.length > 1 || /\p{N}/u.test(t)) && !STOP.has(t));
 }
 
 export type ScoredChunk = Chunk & { score: number };
